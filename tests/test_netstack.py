@@ -110,6 +110,38 @@ class NetStackTests(unittest.TestCase):
             (self.run / 'portal').write_text(value)
             self.assertEqual(self.shell(AUTH + '\nauth_status').returncode, expected, value)
 
+    def uptime_script(self, auth_result=0, began='172939', alive=True):
+        return f'''
+wan_ready() {{ return 0; }}
+auth_status() {{ reply='{{"add_time":"{began}"}}'; return {auth_result}; }}
+now() {{ echo 90061; }}
+date() {{ echo 200000; }}
+getconf() {{ echo 100; }}
+pid_alive() {{ born=9000000; return {0 if alive else 1}; }}
+uptimes
+'''
+
+    def test_uptime_compares_system_session_and_process_with_one_snapshot(self):
+        self.assertEqual(self.ok(self.uptime_script()).splitlines(), [
+            '系统运行: 1天 01:01:01', '认证在线: 0天 07:31:01', 'Xray运行: 0天 00:01:01'])
+
+    def test_uptime_session_can_predate_router_boot(self):
+        self.assertIn('认证在线: 2天 07:33:19', self.ok(self.uptime_script(began='1')))
+
+    def test_uptime_offline_unknown_or_stopped_are_not_zero_duration(self):
+        for status, expected in [(1, '未在线'), (2, '未知（WAN 或门户查询失败）')]:
+            text = self.ok(self.uptime_script(auth_result=status, alive=False))
+            self.assertIn('认证在线: ' + expected, text)
+            self.assertIn('Xray运行: 未运行', text)
+
+    def test_uptime_rejects_missing_invalid_or_future_portal_start(self):
+        for began in ['', 'not-a-time', '0', '300000']:
+            self.assertIn('认证在线: 未知', self.ok(self.uptime_script(began=began)))
+
+    def test_uptime_uses_user_hz_fallback_when_getconf_is_missing(self):
+        script = self.uptime_script().replace('getconf() { echo 100; }', 'getconf() { return 127; }')
+        self.assertIn('Xray运行: 0天 00:01:01', self.ok(script))
+
     def test_accepted_login_requires_online_confirmation(self):
         self.assertEqual(self.shell(AUTH + '\nauth_login').returncode, 1)
         self.assertEqual(self.calls('login'), 1)

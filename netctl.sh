@@ -285,6 +285,44 @@ auth_status() {
     esac
     return 2                          # 未知不等于离线，不能据此发 login。
 }
+duration() {
+    awk -v label="$1" -v seconds="$2" 'BEGIN {
+        printf "%s: %d天 %02d:%02d:%02d\n", label, int(seconds/86400),
+            int(seconds%86400/3600), int(seconds%3600/60), seconds%60
+    }'
+}
+uptimes() (
+    # 只查询门户；不唤醒控制器、不认证、不修改规则。认证会话可长于系统 uptime。
+    auth_result=2; began=''
+    if wan_ready; then
+        auth_status; auth_result=$?
+        [ "$auth_result" != 0 ] || began=$(jget "$reply" add_time)
+    fi
+    # 网络查询完成后统一取样，进程按内核单调时钟计时，不受开机校时影响。
+    system_seconds=$(now); wall_seconds=$(date +%s)
+    duration 系统运行 "$system_seconds"
+    case "$auth_result:$began" in
+        1:*) echo '认证在线: 未在线';;
+        0:*[!0-9]*|0:|0:0) echo '认证在线: 未知（门户未提供有效起始时间）';;
+        0:*)
+            if [ "$began" -le "$wall_seconds" ]; then
+                duration 认证在线 "$((wall_seconds - began))"
+            else
+                echo '认证在线: 未知（本机与门户时间不一致）'
+            fi;;
+        *) echo '认证在线: 未知（WAN 或门户查询失败）';;
+    esac
+    if pid_alive "$RUN/xray.pid" "$ROOT/bin/xray run -c $RUN/client.json"; then
+        # getconf 缺失时使用本机已验证的 Linux USER_HZ=100，不是内核 CONFIG_HZ。
+        ticks=$(getconf CLK_TCK 2>/dev/null) || ticks=100
+        case "$ticks" in ''|*[!0-9]*|0) ticks=100;; esac
+        seconds=$(awk -v elapsed="$system_seconds" -v born="$born" -v ticks="$ticks" \
+            'BEGIN {print int(elapsed-born/ticks)}')
+        [ "$seconds" -ge 0 ] && duration Xray运行 "$seconds" || echo 'Xray运行: 未知'
+    else
+        echo 'Xray运行: 未运行'
+    fi
+)
 bootstrap() (
     target=$(head -n 1 "$RUN/endpoint4" 2>/dev/null)
     [ -n "$target" ] || { log 'bootstrap: endpoint IPv4 unavailable'; return 1; }
@@ -639,6 +677,7 @@ case "${1:-status}" in
         wan_ready || exit 1
         httpget "$PORTAL/cgi-bin/srun_portal?callback=cb&action=logout&username=$(urlenc "$USERNAME")&ac_id=$AC_ID&ip=$WAN_IP&n=200&type=1";;
     auth-status) wan_ready && auth_status; rc=$?; echo "auth_status=$rc (0=online 1=offline 2=unknown)"; exit "$rc";;
+    uptime) uptimes;;
     status)
         echo "mode=$(mode) state=$(cat "$RUN/state" 2>/dev/null) gate=$(cat "$RUN/gate" 2>/dev/null)"
         pid_alive "$RUN/daemon.pid" "$SELF run" && echo "controller=$p" || echo controller=stopped
@@ -648,5 +687,5 @@ case "${1:-status}" in
     health) validate && healthy; rc=$?; echo "health_status=$rc (0=healthy)"; exit "$rc";;
     selftest) selftest;;
     password) password;;
-    *) echo "usage: $0 {mode off|auth|tunnel|status|auth-status|health|login|logout|start|stop|restart|check|selftest|password}"; exit 2;;
+    *) echo "usage: $0 {mode off|auth|tunnel|status|uptime|auth-status|health|login|logout|start|stop|restart|check|selftest|password}"; exit 2;;
 esac

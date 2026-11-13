@@ -56,7 +56,7 @@ python3 tests/live.py policy
 
 ## 离线回归
 
-执行 `python3 -m unittest discover -s tests -v`。当前 42 项，覆盖：
+执行 `python3 -m unittest discover -s tests -v`。当前 47 项，覆盖：
 
 - 在线、明确离线、HTTP/解析错误和在线 IP 不匹配；未知状态不发登录。
 - HTTP 预访问先于 challenge/login；登录接受但仍离线不能报成功。
@@ -73,6 +73,7 @@ python3 tests/live.py policy
 - 备用探测成功时不封锁或重启，下一次探测从本次完成后计时，旧配置默认状态码兼容。
 - 已放行 TUN 的一次网络失败可恢复；本地服务缺失与冷启动不能借该容错放行，连续失败仍阻断并重启。
 - 国内 DNS 顺序复核、主探测成功跳过 DNS、模拟 SOCKS 的 IPv4/IPv6/域名绑定应答、错误握手与 DNS ID/问题/RCODE/截断拒绝、总超时与连接/FIFO 清理。
+- 一次显示系统/认证/Xray 时长、认证早于本次开机、离线与未知不显示假零值、无效/未来会话时间和 USER_HZ 兼容。
 
 另外在目标路由器执行 Shell 语法检查、Xray `run -test` 和 7 个离线编码/加密向量，全部通过。编码核心保留原来经过门户验证的实现，不重写为另一种算法。
 

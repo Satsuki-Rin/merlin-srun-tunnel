@@ -92,6 +92,7 @@ ssh "$ROUTER" 'reboot'
 
 ```sh
 CTL=/jffs/scripts/net-stack/netctl.sh
+$CTL uptime          # 并排显示系统、校园认证会话和 Xray 运行时长
 $CTL mode auth       # 保留自动认证，恢复普通直连
 $CTL mode tunnel     # 恢复隧道保护
 $CTL login           # 请求检查；仍遵守登录限频

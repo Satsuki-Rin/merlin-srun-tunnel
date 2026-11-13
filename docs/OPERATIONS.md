@@ -109,6 +109,7 @@ HTTPS 失败日志包含探测标签、curl 退出码、实际与期望状态码
 ```sh
 D=/jffs/scripts/net-stack
 $D/netctl.sh status
+$D/netctl.sh uptime                  # 系统、认证会话与 Xray 时长，格式为 天 HH:MM:SS
 $D/netctl.sh auth-status             # 0 在线；1 明确离线；2 查询未知
 $D/netctl.sh check                   # Xray 配置 + 离线编码向量
 cru l                               # 只应有一条 net-stack-v2 巡检
@@ -121,6 +122,8 @@ $D/netctl.sh health                  # 与控制器共用探测；0 健康，非
 ```
 
 正常应为 `mode=tunnel state=tunnel-online gate=allow`，一个控制器、一个 Xray，探测返回 `health_status=0 (0=healthy)`。两个路由表同时有 TUN 默认路由和更低优先级的拒绝路由。IPv6 拒绝路由显示 `unreachable ... error -101` 是预期的兜底，不是当前网络失败。
+
+`uptime` 只查询门户，不触发登录或重启。系统和 Xray 的时长来自内核单调时钟，认证会话时长使用当前门户返回的 `add_time`；认证可能早于本次路由器开机。查询失败、会话起始时间无效或本机时钟落后时明确显示未知，未运行的 Xray 显示未运行。该字段含义依赖门户协议，不能用控制器进程时长或 `sum_seconds` 代替认证会话时长。
 
 客户端验收必须绑定接路由器的网卡或源地址；双网卡电脑的普通 `curl` 可能从另一张卡成功，不能证明路由器可用。IPv6 目标不可达时，要区分本地转发与家庭出口限制；不能用一个海外 IPv6 站点的失败断言隧道故障。
 
