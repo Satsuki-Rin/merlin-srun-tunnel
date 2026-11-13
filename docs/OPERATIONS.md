@@ -31,7 +31,8 @@
 | `HOME_DNS` | 经隧道可达的家庭 DNS 地址 |
 | `DNS1`、`DNS2` | 引导 DNS 的 IPv4 地址，仅用于解析家庭端点 |
 | `SOCKS_PORT`、`DNS_PORT` | 本机 SOCKS 和 DNS 转发端口；默认 1080、15353，避免与插件冲突 |
-| `HEALTH_URL` | 经本地 SOCKS 探测的 HTTPS URL；成功必须返回 204 |
+| `HEALTH_URL`、`HEALTH_STATUS` | 主探测 HTTPS URL 和精确预期状态码；模板为 `https://$ENDPOINT:$ENDPOINT_PORT/`、200，访问家庭端点 fallback |
+| `HEALTH_FALLBACK_URL`、`HEALTH_FALLBACK_STATUS` | 主探测失败后的独立复核；模板为 Cloudflare 的 generate_204、204；URL 设为空可禁用 |
 | `AUTH_INTERVAL`、`LOGIN_INTERVAL` | 门户检查与最小登录间隔；默认 30、60 秒，分别不得低于 15、20 秒 |
 | `HEALTH_INTERVAL`、`DNS_INTERVAL` | 隧道健康和端点 DNS 检查间隔；默认 15、60 秒，健康间隔至少 5 秒 |
 | `HTTP_TIMEOUT`、`BOOT_DELAY` | 单次 HTTP 超时及首次稳定等待；默认 8、20 秒，HTTP 超时须在 1–30 秒 |
@@ -74,6 +75,10 @@ WAN / firewall hook ──► 同步安装保护 + 请求重新检查
 
 Xray 由控制器直接启动和回收。意外退出后的重启延迟从 2 秒递增，上限 300 秒；存活但连续两次健康检查失败也会停止重启，首次等待至少 20 秒，避免持续冲击家庭端点。健康恢复后重置退避。实际恢复还包含进程装载、DNS 和 TLS 耗时，不承诺“一秒内恢复”。控制器被强杀时，cron 最迟约一分钟重新拉起它。
 
+健康检查先确认 Xray 身份、TUN 和本机 DNS 监听，再经本地 SOCKS 发起完整 HTTPS GET。默认主探测为自己的 nginx fallback，要求 curl 成功且返回配置的 200；失败后才请求独立备用站点。任一成功即可证明该次请求已通过代理隧道。已放行的隧道首轮两个网络探测都失败时记为 `tunnel-degraded`，仍只允许经 TUN 转发；连续两轮失败才封锁并重启，成功即清零计数。冷启动、已有封锁、Xray/TUN/DNS 监听缺失仍立即保持或进入封锁，不会借容错提前放行或允许 WAN 直连。每个请求最多 `HTTP_TIMEOUT` 秒，下一轮从本轮结束后计时。禁用 curlrc 和 curl 重试，不跟随重定向、不跳过证书验证，`NO_PROXY` 也不能使请求绕过 SOCKS。
+
+失败日志包含主/备用标签、curl 退出码、实际与期望 HTTP 状态码及耗时，不包含目标 URL。fallback 应由已配置证书的服务端提供稳定页面；从家庭服务器访问自身公网域名需确保回环路径可达。它证明代理传输与目标 HTTPS 服务可用，不证明全部互联网、家庭 DNS、TUN 实际转发或反向访问正常，仍需客户端验收。旧配置显式设置 `HEALTH_URL` 却未设置状态码时继续要求 204、默认不启用备用站点；迁移时请一起更新四个配置项。没有设置 URL 时自动使用端点 fallback，默认要求 200。
+
 ## 流量保护与 DNS
 
 - LAN 只允许转发到同一 LAN 或 `xray0`，没有校园网段、家庭网段或普通 WAN 的直连例外。访问家庭 `192.168.5.0/24` 同样经过隧道。
@@ -109,11 +114,10 @@ ip route show table 300; ip -6 route show table 300
 iptables -S NS2_FWD; ip6tables -S NS2_FWD
 iptables -S NS2_OUT; ip6tables -S NS2_OUT
 sed -n '/>>> net-stack dns/,/<<< net-stack dns/p' /etc/dnsmasq.conf
-curl --socks5-hostname 127.0.0.1:1080 -m 10 -o /dev/null \
-    -w '%{http_code}\n' https://www.gstatic.com/generate_204
+$D/netctl.sh health                  # 与控制器共用探测；0 健康，非 0 失败
 ```
 
-正常应为 `mode=tunnel state=tunnel-online gate=allow`，一个控制器、一个 Xray，SOCKS 返回 204。两个路由表同时有 TUN 默认路由和更低优先级的拒绝路由。IPv6 拒绝路由显示 `unreachable ... error -101` 是预期的兜底，不是当前网络失败。
+正常应为 `mode=tunnel state=tunnel-online gate=allow`，一个控制器、一个 Xray，探测返回 `health_status=0 (0=healthy)`。两个路由表同时有 TUN 默认路由和更低优先级的拒绝路由。IPv6 拒绝路由显示 `unreachable ... error -101` 是预期的兜底，不是当前网络失败。
 
 客户端验收必须绑定接路由器的网卡或源地址；双网卡电脑的普通 `curl` 可能从另一张卡成功，不能证明路由器可用。IPv6 目标不可达时，要区分本地转发与家庭出口限制；不能用一个海外 IPv6 站点的失败断言隧道故障。
 

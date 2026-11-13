@@ -37,6 +37,8 @@ flowchart TD
 
 模式在重启后保留。`off` 不会注销已经建立的校园会话；需要注销时再执行 `logout`。端点 DNS、门户 HTTP 等必要引导流量会直连，具体边界见 [运行与配置](docs/OPERATIONS.md#流量保护与-dns)。
 
+隧道健康默认探测家庭端点的 nginx fallback 页面，经过本地 SOCKS 完成 HTTPS 请求并检查预期状态码；主探测失败才请求独立的备用站点，任一成功即可放行。已经正常工作的隧道允许一次网络探测失败，连续两轮失败才封锁重启；冷启动、本地进程或 TUN 缺失不享受该容错，始终不回落到 WAN 直连。该检查不能代表所有公网网站、家庭 DNS 或反向组网都正常。
+
 ## 安装
 
 以下命令在已经克隆的项目根目录执行。先在路由器启用 SSH 和 JFFS 自定义脚本，并准备与设备匹配的 Xray。
@@ -52,7 +54,7 @@ chmod 600 "$HOME/.config/merlin-srun-tunnel/net-stack.conf"
 install -m 755 /path/to/xray bin/xray
 ```
 
-编辑配置，填写门户地址和 `AC_ID`、账号密码、端点域名、UUID、TLS 名称、XHTTP 参数与家庭 DNS；同时核对接口、LAN 网段及 IPv6 ULA。模板中的地址和标识仅为示例，不能直接用于登录。配置采用 Shell 语法，只加载自己信任的文件。字段说明见 [配置参考](docs/OPERATIONS.md#配置参考)。
+编辑配置，填写门户地址和 `AC_ID`、账号密码、端点域名、UUID、TLS 名称、XHTTP 参数与家庭 DNS；同时核对接口、LAN 网段及 IPv6 ULA。确认 fallback 页面的 HTTPS 证书有效，`HEALTH_STATUS` 与其实际响应一致（默认 200）；若家庭服务器不能访问自身公网域名，换成经隧道可达的 HTTPS 目标。模板中的地址和标识仅为示例，不能直接用于登录。配置采用 Shell 语法，只加载自己信任的文件。字段说明见 [配置参考](docs/OPERATIONS.md#配置参考)。
 
 ### 2. 上传并安装
 
@@ -94,6 +96,7 @@ $CTL mode auth       # 保留自动认证，恢复普通直连
 $CTL mode tunnel     # 恢复隧道保护
 $CTL login           # 请求检查；仍遵守登录限频
 $CTL check           # 验证配置和编码向量
+$CTL health          # 立即探测并返回 health_status，不改防火墙或重启服务
 $CTL restart         # 修改配置后重载
 $CTL password        # 交互更新校园密码
 ```

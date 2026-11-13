@@ -3,7 +3,7 @@
 ROUTER is required. SSH keys are supported; SSHPASS optionally enables sshpass.
 Results are private diagnostic artifacts and are excluded from Git.
 """
-import argparse, base64, ipaddress, json, os, pathlib, shlex, shutil, socket, struct, subprocess, time
+import argparse, base64, ipaddress, json, os, pathlib, re, shlex, shutil, socket, struct, subprocess, time
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 RESULTS=pathlib.Path(os.environ.get('LIVE_RESULTS', str(ROOT/'artifacts/live-results.json'))).expanduser()
 HOST=os.environ.get('ROUTER','')
@@ -25,7 +25,9 @@ def wait_online(timeout=180):
             out=ssh(f'{CTL} status',timeout=10)
             line=out.splitlines()[0]
             if line!=last: print(f'+{time.monotonic()-start:.1f}s {line}',flush=True);last=line
-            if 'state=tunnel-online gate=allow' in line:
+            if ('state=tunnel-online gate=allow' in line
+                    and re.search(r'^controller=\d+$',out,re.M)
+                    and re.search(r'^xray=\d+$',out,re.M)):
                 return round(time.monotonic()-start,1)
         except (RuntimeError,subprocess.TimeoutExpired): pass
         time.sleep(3)
@@ -35,13 +37,13 @@ def wait_online(timeout=180):
 def baseline():
     checks=ssh(f'''{CTL} status
 printf '\\nCRON\\n'; cru l
-printf '\\nHEALTH\\n'; . /jffs/scripts/net-stack/net-stack.conf; curl --noproxy '' -s -m 10 --socks5-hostname "127.0.0.1:$SOCKS_PORT" -o /dev/null -w '%{{http_code}}' "$HEALTH_URL"
+printf '\\nHEALTH\\n'; {CTL} health
 printf '\\nCTF\\n'; nvram get ctf_disable; nvram get ctf_disable_force
 printf '\\nVM\\n'; cat /proc/sys/vm/overcommit_memory; cat /proc/sys/vm/overcommit_ratio
 printf '\\nOLD_PROCESSES\\n'; ps | grep -E '[s]run.sh watch|[x]ray-super.sh loop'
 ''',check=False)
     assert 'state=tunnel-online gate=allow' in checks,checks
-    assert '204\nCTF' in checks,checks
+    assert 'health_status=0 (0=healthy)' in checks,checks
     assert checks.count('#net-stack-v2#')==1,checks
     assert 'srun.sh watch' not in checks and 'xray-super.sh loop' not in checks,checks
     print(checks,flush=True)

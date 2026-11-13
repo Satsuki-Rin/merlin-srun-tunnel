@@ -50,6 +50,21 @@ service() { echo service >> "$RUN/calls"; }
 pid_alive() { [ "${XRAY_ALIVE:-1}" = 1 ]; }
 healthy() { [ "${HEALTH_OK:-1}" = 1 ]; }
 '''
+HEALTH = r'''
+TUN=lo
+pid_alive() { return 0; }
+netstat() { echo 'tcp 0 0 127.0.0.1:15353 0.0.0.0:* LISTEN'; }
+curl() {
+    printf '%s\n' "$@" >> "$RUN/curl-args"
+    case "$*" in
+        *https://home.example.com:8443/*)
+            echo primary >> "$RUN/calls"
+            echo "${PRIMARY_CODE:-200} 0.250"
+            return "${PRIMARY_RC:-0}";;
+        *) echo secondary >> "$RUN/calls"; echo "${SECONDARY_CODE:-204} 0.300"; return "${SECONDARY_RC:-0}";;
+    esac
+}
+'''
 
 
 class NetStackTests(unittest.TestCase):
@@ -142,6 +157,87 @@ class NetStackTests(unittest.TestCase):
         self.ok(STEP + '\nHEALTH_OK=0; step\nTEST_NOW=1015; step')
         self.assertEqual(self.calls('stop'), 1)
         self.assertEqual((self.run / 'gate').read_text().strip(), 'block')
+
+    def test_primary_fallback_200_does_not_request_secondary(self):
+        self.ok(HEALTH + '\nhealthy')
+        self.assertEqual(self.calls(), ['primary'])
+        arguments = (self.run / 'curl-args').read_text().splitlines()
+        self.assertEqual(arguments[0], '--disable')
+        for option in ['--noproxy', '--socks5-hostname', '127.0.0.1:1080', '--retry', '-m']:
+            self.assertIn(option, arguments)
+        self.assertNotIn('-k', arguments)
+        self.assertNotIn('-L', arguments)
+
+    def test_primary_timeout_is_confirmed_by_secondary(self):
+        self.ok(HEALTH + '\nhealthy', PRIMARY_CODE='000', PRIMARY_RC='28')
+        self.assertEqual(self.calls(), ['primary', 'secondary'])
+        log = (self.run / 'control.log').read_text()
+        self.assertIn('health primary failed: curl=28 http=000 expected=200 seconds=0.250', log)
+        self.assertNotIn('home.example.com', log)
+
+    def test_both_probe_failures_are_unhealthy(self):
+        result = self.shell(HEALTH + '\nhealthy', PRIMARY_RC='28', PRIMARY_CODE='000', SECONDARY_CODE='503')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('health secondary failed: curl=0 http=503 expected=204', (self.run / 'control.log').read_text())
+
+    def test_http_code_alone_cannot_hide_transfer_or_tls_failure(self):
+        for code, status in [('200', '28'), ('000', '60'), ('302', '0')]:
+            result = self.shell(HEALTH + '\nHEALTH_FALLBACK_URL=; healthy', PRIMARY_CODE=code, PRIMARY_RC=status)
+            self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.calls('secondary'), 0)
+
+    def test_probe_success_cannot_hide_missing_local_service(self):
+        for failure in ['pid_alive() { return 1; }', 'TUN=netstack-no-such-interface', 'netstat() { :; }']:
+            self.assertEqual(self.shell(HEALTH + '\n' + failure + '\nhealthy').returncode, 1)
+        self.assertEqual(self.calls(), [])
+
+    def test_secondary_success_keeps_gate_open_without_restart(self):
+        (self.run / 'portal').write_text('online')
+        script = STEP.replace('healthy() { [ "${HEALTH_OK:-1}" = 1 ]; }', '')
+        self.ok(script + HEALTH + '\nstep', PRIMARY_CODE='000', PRIMARY_RC='28')
+        self.assertEqual((self.run / 'gate').read_text().strip(), 'allow')
+        self.assertEqual(self.calls('stop'), 0)
+
+    def test_one_network_failure_keeps_existing_tun_then_recovers(self):
+        (self.run / 'portal').write_text('online')
+        (self.run / 'gate').write_text('allow\n')
+        self.ok(STEP + r'''
+HEALTH_OK=0; step
+[ "$(cat "$RUN/gate")" = allow ] || exit 1
+[ "$(cat "$RUN/state")" = tunnel-degraded ] || exit 1
+HEALTH_OK=1; TEST_NOW=1015; step
+''')
+        self.assertEqual((self.run / 'state').read_text().strip(), 'tunnel-online')
+        self.assertEqual(self.calls('stop'), 0)
+        self.assertEqual(self.calls('firewall block'), 0)
+
+    def test_local_failure_or_cold_start_cannot_use_network_grace(self):
+        (self.run / 'portal').write_text('online')
+        for gate, local_failed in [('allow', 1), ('block', 0)]:
+            (self.run / 'gate').write_text(gate + '\n')
+            self.ok(STEP + f'\nhealth_local_failed={local_failed}; HEALTH_OK=0; step')
+            self.assertEqual((self.run / 'gate').read_text().strip(), 'block')
+            self.assertEqual((self.run / 'state').read_text().strip(), 'tunnel-unhealthy')
+
+    def test_health_interval_starts_after_probes_finish(self):
+        (self.run / 'portal').write_text('online')
+        self.ok(STEP + r'''
+healthy() { TEST_NOW=1016; return 1; }
+step
+[ "$next_health" = 1031 ] || exit 1
+TEST_NOW=1017; step
+[ "$failures" = 1 ]
+''')
+        self.assertEqual(self.calls('stop'), 0)
+
+    def test_legacy_and_automatic_probe_defaults(self):
+        path = self.root / 'net-stack.conf'
+        original = path.read_text()
+        base = '\n'.join(line for line in original.splitlines() if not line.startswith('HEALTH_'))
+        path.write_text(base + '\nHEALTH_URL=https://www.gstatic.com/generate_204\nHEALTH_INTERVAL=15\n')
+        self.assertEqual(self.ok('echo "$HEALTH_STATUS|$HEALTH_FALLBACK_URL"').strip(), '204|')
+        path.write_text(base + '\nHEALTH_INTERVAL=15\n')
+        self.assertEqual(self.ok('echo "$HEALTH_URL|$HEALTH_STATUS"').strip(), 'https://home.example.com:8443/|200')
 
     def test_dns_failure_preserves_working_cached_tunnel(self):
         (self.run / 'portal').write_text('online')
@@ -288,7 +384,10 @@ echo tunnel > "$MODEFILE"; touch "$RUN/event"; firewall allow
         self.assertNotIn('dns', config)
 
     def test_unsafe_config_and_too_fast_login_are_rejected(self):
-        for override in ['LAN_IF="br0;reboot"', 'TABLE=200', 'LOGIN_INTERVAL=10', 'HTTP_TIMEOUT=0']:
+        for override in ['LAN_IF="br0;reboot"', 'TABLE=200', 'LOGIN_INTERVAL=10', 'HTTP_TIMEOUT=0',
+                         'HEALTH_URL=http://home.example.com/', 'HEALTH_STATUS=000',
+                         'HEALTH_STATUS=2000', 'HEALTH_FALLBACK_URL=http://example.com/',
+                         'HEALTH_FALLBACK_STATUS=500']:
             self.assertNotEqual(self.shell(override + '\nvalidate').returncode, 0)
 
 

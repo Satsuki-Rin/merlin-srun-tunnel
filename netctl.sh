@@ -9,6 +9,15 @@ MODEFILE=$ROOT/mode
 mkdir -p "$RUN"
 [ -r "$CONF" ] || { echo "缺少配置：$CONF" >&2; exit 1; }
 . "$CONF"
+# 旧配置显式指定的探测仍默认要求 204；新配置默认探测自己的 HTTPS fallback。
+if [ -z "${HEALTH_URL:-}" ]; then
+    HEALTH_URL="https://$ENDPOINT:$ENDPOINT_PORT/"
+    HEALTH_STATUS=${HEALTH_STATUS:-200}
+else
+    HEALTH_STATUS=${HEALTH_STATUS:-204}
+fi
+HEALTH_FALLBACK_URL=${HEALTH_FALLBACK_URL:-}
+HEALTH_FALLBACK_STATUS=${HEALTH_FALLBACK_STATUS:-204}
 PORTAL="http://$PORTAL_IP:$PORTAL_PORT"
 SELF=$ROOT/netctl.sh
 
@@ -42,6 +51,16 @@ pid_alive() {
 }
 remember_pid() { put "$1" "$2 $(awk '{print $22}' "/proc/$2/stat")"; }
 validate() {
+    for n in HEALTH_URL HEALTH_FALLBACK_URL; do
+        eval 'v=${'"$n"'}'
+        [ "$n" != HEALTH_FALLBACK_URL ] || [ -n "$v" ] || continue
+        case "$v" in https://?*) ;; *) echo "无效 HTTPS 探测地址 $n" >&2; return 1;; esac
+        case "$v" in *[[:space:]]*) echo "探测地址不能包含空白 $n" >&2; return 1;; esac
+    done
+    for n in HEALTH_STATUS HEALTH_FALLBACK_STATUS; do
+        eval 'v=${'"$n"'}'
+        case "$v" in [23][0-9][0-9]) ;; *) echo "无效探测状态码 $n" >&2; return 1;; esac
+    done
     for n in LAN_IF WAN_IF TUN ENDPOINT TLS_NAME XHTTP_HOST; do
         eval 'v=${'"$n"'}'
         case "$v" in ''|*[!a-zA-Z0-9_.:-]*) echo "无效配置 $n" >&2; return 1;; esac
@@ -354,11 +373,32 @@ xray_start() {
     remember_pid "$RUN/xray.pid" "$!"
     log "xray started pid=$!"
 }
+health_probe() (
+    # 独立子 shell 避免覆盖控制循环变量。强制经 SOCKS、校验证书，不跟随跳转。
+    # --disable 忽略 curlrc；失败不能因环境代理、NO_PROXY 或重试而绕路或无限等待。
+    label=$1; url=$2; expected=$3
+    result=$(curl --disable --noproxy '' --socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+        --retry 0 -s -m "$HTTP_TIMEOUT" -o /dev/null \
+        -w '%{http_code} %{time_total}' "$url" 9>&- 8>&- 2>/dev/null)
+    rc=$?
+    read code elapsed <<EOF
+$result
+EOF
+    [ "$rc" = 0 ] && [ "$code" = "$expected" ] && return 0
+    # 不记录 URL，避免把私有端点与路径写入可分享的诊断日志。
+    log "health $label failed: curl=$rc http=${code:-000} expected=$expected seconds=${elapsed:-unknown}"
+    return 1
+)
 healthy() {
-    pid_alive "$RUN/xray.pid" "$ROOT/bin/xray run -c $RUN/client.json" || return 1
-    [ -d "/sys/class/net/$TUN" ] || return 1
-    netstat -lnt | grep -q ":$DNS_PORT " || return 1
-    [ "$(curl --noproxy '' -s -m "$HTTP_TIMEOUT" -o /dev/null -w '%{http_code}' --socks5-hostname "127.0.0.1:$SOCKS_PORT" "$HEALTH_URL" 9>&-)" = 204 ]
+    health_local_failed=1
+    pid_alive "$RUN/xray.pid" "$ROOT/bin/xray run -c $RUN/client.json" || { log 'health local failed: xray not running'; return 1; }
+    [ -d "/sys/class/net/$TUN" ] || { log 'health local failed: TUN missing'; return 1; }
+    netstat -lnt | grep -q ":$DNS_PORT " || { log 'health local failed: DNS listener missing'; return 1; }
+    health_local_failed=0
+    health_probe primary "$HEALTH_URL" "$HEALTH_STATUS" && return 0
+    [ -n "$HEALTH_FALLBACK_URL" ] || return 1
+    # 独立目的地复核单站点故障；仍完整经过同一个 Xray 隧道。
+    health_probe secondary "$HEALTH_FALLBACK_URL" "$HEALTH_FALLBACK_STATUS"
 }
 
 # ---- 唯一状态机：每次检查有限步骤，失败回到下轮；不存在永久 WAN_DOWN。 ----
@@ -422,13 +462,20 @@ step() {
         restart_at=$((tick + 10)); next_health=$((tick + 2))
     fi
     if [ "$tick" -ge "$next_health" ]; then
-        next_health=$((tick + HEALTH_INTERVAL))
         if healthy; then
             failures=0; restart_delay=2
             firewall allow || { state firewall-error; return 1; }
             [ "$(cat "$RUN/gate")" != allow ] || state tunnel-online
         else
-            firewall block; failures=$((failures + 1)); state tunnel-unhealthy
+            failures=$((failures + 1))
+            # 已验证的 TUN 首轮网络探测失败可容忍一次；仍无 WAN 直连权限。
+            # 冷启动、已有封锁或本地服务缺失不能借此提前放行。
+            if [ "${health_local_failed:-0}" = 0 ] && [ "$failures" = 1 ] &&
+               [ "$(cat "$RUN/gate" 2>/dev/null)" = allow ]; then
+                state tunnel-degraded
+            else
+                firewall block; state tunnel-unhealthy
+            fi
             if [ "$failures" -ge 2 ]; then
                 [ "$restart_delay" -ge 20 ] || restart_delay=20
                 xray_stop; failures=0; restart_at=$(( $(now) + restart_delay ))
@@ -436,6 +483,8 @@ step() {
                 log "xray health restart; next start at uptime=$restart_at"
             fi
         fi
+        # 从探测完成后计时，避免双探针耗时超过间隔后立即再次探测并重启。
+        next_health=$(( $(now) + HEALTH_INTERVAL ))
     fi
 }
 run() {
@@ -535,7 +584,8 @@ case "${1:-status}" in
         pid_alive "$RUN/xray.pid" "$ROOT/bin/xray run -c $RUN/client.json" && echo "xray=$p" || echo xray=stopped
         ip route show table "$TABLE"; ip -6 route show table "$TABLE";;
     check) validate && render_xray && "$ROOT/bin/xray" run -test -c "$RUN/client.json" && selftest;;
+    health) validate && healthy; rc=$?; echo "health_status=$rc (0=healthy)"; exit "$rc";;
     selftest) selftest;;
     password) password;;
-    *) echo "usage: $0 {mode off|auth|tunnel|status|auth-status|login|logout|start|stop|restart|check|selftest|password}"; exit 2;;
+    *) echo "usage: $0 {mode off|auth|tunnel|status|auth-status|health|login|logout|start|stop|restart|check|selftest|password}"; exit 2;;
 esac
