@@ -1,0 +1,39 @@
+# 唯一用户配置。复制为 net-stack.conf，填写账号与 UUID，chmod 600。
+# Shell 语法；含特殊字符的密码请用单引号，密码含单引号时使用 netctl.sh password。
+LAN_IF=br0
+LAN_CIDR=192.168.50.0/24
+LAN6_CIDR=fd50:50::/64
+LAN6_ADDR=fd50:50::1/64
+WAN_IF=eth0
+WAN_UNIT=0
+TABLE=300                         # Merlin 占用 100/200/111..115，勿复用
+RULE_PRIORITY=12000
+TUN=xray0
+TUN4=172.19.0.1/30
+TUN6=fd00:19::1/126
+MTU=1400
+PORTAL_IP=10.0.0.1                 # 示例；改为实际深澜门户 IPv4
+PORTAL_PORT=80
+AC_ID=1                           # 示例；从实际门户确认
+USERNAME=''
+PASSWORD=''
+DOUBLE_STACK=0
+ENDPOINT=home.example.com          # DDNS，禁止填某次查询的临时 IP
+ENDPOINT_PORT=8443
+UUID='00000000-0000-0000-0000-000000000000'
+TLS_NAME=home.example.com
+XHTTP_HOST=home.example.com
+XHTTP_PATH=/home-net
+HOME_DNS=192.168.5.1
+DNS1=119.29.29.29
+DNS2=223.5.5.5
+SOCKS_PORT=1080
+DNS_PORT=15353                    # 5353 常被 mDNS 占用
+HEALTH_URL=https://www.gstatic.com/generate_204
+# 所有计时使用 /proc/uptime，不受开机校时影响。
+AUTH_INTERVAL=30
+LOGIN_INTERVAL=60                 # 所有入口共用；允许调大，不允许低于 20 秒
+HEALTH_INTERVAL=15
+DNS_INTERVAL=60
+HTTP_TIMEOUT=8
+BOOT_DELAY=20

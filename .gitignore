@@ -1,0 +1,31 @@
+# Local credentials, router state, and deployment artifacts.
+.private/
+net-stack.conf
+mode
+artifacts/
+dist/
+*.log
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.bak
+.env
+.env.*
+*.key
+*.pem
+
+# Xray is an independently built dependency.
+bin/*
+!bin/README.md
+
+# Python and editor files.
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+.DS_Store
+*~
+*.swp
+*:Zone.Identifier
