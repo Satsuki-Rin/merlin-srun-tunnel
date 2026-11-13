@@ -3,6 +3,9 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import socket
+import struct
+import threading
 import tempfile
 import time
 import unittest
@@ -51,6 +54,8 @@ pid_alive() { [ "${XRAY_ALIVE:-1}" = 1 ]; }
 healthy() { [ "${HEALTH_OK:-1}" = 1 ]; }
 '''
 HEALTH = r'''
+HEALTH_DNS_SERVERS=
+HEALTH_FALLBACK_URL=https://backup.example.net/
 TUN=lo
 pid_alive() { return 0; }
 netstat() { echo 'tcp 0 0 127.0.0.1:15353 0.0.0.0:* LISTEN'; }
@@ -174,6 +179,115 @@ class NetStackTests(unittest.TestCase):
         log = (self.run / 'control.log').read_text()
         self.assertIn('health primary failed: curl=28 http=000 expected=200 seconds=0.250', log)
         self.assertNotIn('home.example.com', log)
+
+    def test_domestic_dns_are_tried_in_order_until_one_answers(self):
+        self.ok(HEALTH + r'''
+HEALTH_DNS_SERVERS='119.29.29.29 223.5.5.5'
+health_dns() { echo "$1" >> "$RUN/calls"; [ "$1" = 223.5.5.5 ]; }
+healthy
+''', PRIMARY_RC='28', PRIMARY_CODE='000')
+        self.assertEqual(self.calls(), ['primary', '119.29.29.29', '223.5.5.5'])
+
+    def test_primary_success_skips_dns_and_failed_dns_cannot_mask_failure(self):
+        script = HEALTH + r'''
+HEALTH_DNS_SERVERS='119.29.29.29 223.5.5.5'
+HEALTH_FALLBACK_URL=
+health_dns() { echo "$1" >> "$RUN/calls"; return 1; }
+healthy
+'''
+        self.ok(script)
+        self.assertEqual(self.calls(), ['primary'])
+        self.assertEqual(self.shell(script, PRIMARY_RC='28', PRIMARY_CODE='000').returncode, 1)
+        self.assertEqual(self.calls()[-3:], ['primary', '119.29.29.29', '223.5.5.5'])
+
+    def dns_wire_probe(self, fault='', bound='ipv4'):
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        listener.settimeout(4)
+        port = listener.getsockname()[1]
+        observed = []
+        failures = []
+        finished = threading.Event()
+
+        def receive(connection, size):
+            data = bytearray()
+            while len(data) < size:
+                part = connection.recv(size - len(data))
+                if not part:
+                    raise EOFError('client disconnected')
+                data.extend(part)
+            return bytes(data)
+
+        def serve():
+            try:
+                with listener, listener.accept()[0] as connection:
+                    connection.settimeout(4)
+                    observed.append(receive(connection, 3))
+                    connection.sendall(b'\x05\x02' if fault == 'auth' else b'\x05\x00')
+                    if fault == 'auth': return
+                    observed.append(receive(connection, 10))
+                    if fault == 'connect':
+                        connection.sendall(b'\x05\x05\x00\x01' + b'\0' * 6)
+                        return
+                    addresses = {'ipv4': b'\x01' + b'\0' * 6, 'ipv6': b'\x04' + b'\0' * 18,
+                                 'domain': b'\x03\x03foo\0\0'}
+                    connection.sendall(b'\x05\x00\x00' + addresses[bound])
+                    size = struct.unpack('!H', receive(connection, 2))[0]
+                    query = receive(connection, size)
+                    observed.append(query)
+                    if fault == 'timeout':
+                        finished.wait(3)
+                        return
+                    ident = 0x5678 if fault == 'id' else 0x1234
+                    flags = 0x8183 if fault == 'rcode' else 0x8380 if fault == 'truncated' else 0x8180
+                    answers = 0 if fault == 'empty' else 1
+                    question = bytearray(query[12:])
+                    if fault == 'question': question[1] = ord('z')
+                    reply = struct.pack('!HHHHHH', ident, flags, 1, answers, 0, 0) + question
+                    reply += bytes.fromhex('c00c000100010000003c0004c0000201')
+                    wire = struct.pack('!H', len(reply)) + reply
+                    if fault == 'short': wire = wire[:-3]
+                    for offset in range(0, len(wire), 3):
+                        connection.sendall(wire[offset:offset + 3])
+            except (OSError, EOFError) as error:
+                failures.append(error)
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        try:
+            result = self.shell(f'''
+timeout() {{ shift; command timeout "$@"; }}
+SOCKS_PORT={port}; HTTP_TIMEOUT=1
+health_dns 119.29.29.29
+''')
+        finally:
+            finished.set()
+            server.join(4)
+        self.assertFalse(server.is_alive())
+        self.assertEqual(failures, [])
+        self.assertFalse(list(self.run.glob('health-dns-*')))
+        self.assertEqual(observed[0], b'\x05\x01\x00')
+        if fault != 'auth':
+            self.assertEqual(observed[1], b'\x05\x01\x00\x01' + socket.inet_aton('119.29.29.29') + b'\x00\x35')
+        return result
+
+    def test_dns_wire_protocol_via_socks_with_all_bound_address_types(self):
+        for bound in ['ipv4', 'ipv6', 'domain']:
+            with self.subTest(bound=bound):
+                result = self.dns_wire_probe(bound=bound)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dns_wire_rejects_failed_handshake_or_invalid_dns_response(self):
+        for fault in ['auth', 'connect', 'id', 'rcode', 'truncated', 'empty', 'question', 'short']:
+            with self.subTest(fault=fault):
+                self.assertNotEqual(self.dns_wire_probe(fault=fault).returncode, 0)
+
+    def test_dns_wire_probe_deadline_and_cleanup(self):
+        started = time.monotonic()
+        self.assertNotEqual(self.dns_wire_probe(fault='timeout').returncode, 0)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIn('phase=dns-response', (self.run / 'control.log').read_text())
 
     def test_both_probe_failures_are_unhealthy(self):
         result = self.shell(HEALTH + '\nhealthy', PRIMARY_RC='28', PRIMARY_CODE='000', SECONDARY_CODE='503')
@@ -389,6 +503,8 @@ echo tunnel > "$MODEFILE"; touch "$RUN/event"; firewall allow
                          'HEALTH_STATUS=2000', 'HEALTH_FALLBACK_URL=http://example.com/',
                          'HEALTH_FALLBACK_STATUS=500']:
             self.assertNotEqual(self.shell(override + '\nvalidate').returncode, 0)
+        for servers in ['1.2.3', '1.2.3.999', 'example.com', '1.2.3.4;reboot']:
+            self.assertNotEqual(self.shell(f"HEALTH_DNS_SERVERS='{servers}'\nvalidate").returncode, 0)
 
 
 if __name__ == '__main__':

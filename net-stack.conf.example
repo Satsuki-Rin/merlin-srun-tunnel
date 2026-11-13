@@ -32,8 +32,10 @@ DNS_PORT=15353                    # 5353 常被 mDNS 占用
 # 主探测访问自己的 nginx fallback，必须经本地 SOCKS；按实际响应设置状态码。
 HEALTH_URL="https://$ENDPOINT:$ENDPOINT_PORT/"
 HEALTH_STATUS=200
-# 主探测失败才复核；任一成功即视为隧道可用。设空字符串可禁用复核。
-HEALTH_FALLBACK_URL=https://cp.cloudflare.com/generate_204
+# 主探测失败后，经 SOCKS 依次向国内 DNS 的 TCP/53 查询 example.com；任一成功即可。
+HEALTH_DNS_SERVERS='119.29.29.29 223.5.5.5'
+# 可选额外 HTTPS 复核，排在 DNS 之后；默认禁用，不依赖境外站点。
+HEALTH_FALLBACK_URL=''
 HEALTH_FALLBACK_STATUS=204
 # 所有计时使用 /proc/uptime，不受开机校时影响。
 AUTH_INTERVAL=30

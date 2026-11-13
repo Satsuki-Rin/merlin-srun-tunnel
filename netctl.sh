@@ -18,6 +18,7 @@ else
 fi
 HEALTH_FALLBACK_URL=${HEALTH_FALLBACK_URL:-}
 HEALTH_FALLBACK_STATUS=${HEALTH_FALLBACK_STATUS:-204}
+HEALTH_DNS_SERVERS=${HEALTH_DNS_SERVERS:-}
 PORTAL="http://$PORTAL_IP:$PORTAL_PORT"
 SELF=$ROOT/netctl.sh
 
@@ -51,6 +52,12 @@ pid_alive() {
 }
 remember_pid() { put "$1" "$2 $(awk '{print $22}' "/proc/$2/stat")"; }
 validate() {
+    for resolver in $HEALTH_DNS_SERVERS; do
+        printf '%s\n' "$resolver" | awk -F. '
+            NF != 4 {exit 1}
+            {for (field=1; field<=4; field++) if ($field !~ /^[0-9]+$/ || $field+0>255) exit 1}
+        ' || { echo '无效健康探测 DNS IPv4' >&2; return 1; }
+    done
     for n in HEALTH_URL HEALTH_FALLBACK_URL; do
         eval 'v=${'"$n"'}'
         [ "$n" != HEALTH_FALLBACK_URL ] || [ -n "$v" ] || continue
@@ -373,6 +380,56 @@ xray_start() {
     remember_pid "$RUN/xray.pid" "$!"
     log "xray started pid=$!"
 }
+health_dns() (
+    # 独立 TCP 会话：nc 只连本机 SOCKS，DNS 请求由 Xray 从服务端发往 resolver:53。
+    # 用 FIFO 逐步完成握手，避免不同 SOCKS 实现丢弃提前发送的 DNS 数据。
+    resolver=$1; phase=setup; started=$(now)
+    probe_dir=$RUN/health-dns-$$
+    mkdir "$probe_dir" || return 1
+    client_pid=''
+    trap 'result=$?; exec 7>&- 6<&-; if [ -n "$client_pid" ]; then kill "$client_pid" 2>/dev/null; wait "$client_pid" 2>/dev/null; fi; rm -rf "$probe_dir"; [ "$result" = 0 ] || log "health DNS failed: server=$resolver phase=$phase seconds=$(( $(now) - started ))"' EXIT
+    trap 'exit 1' INT TERM
+    mknod "$probe_dir/send" p && mknod "$probe_dir/receive" p || return 1
+    # Merlin BusyBox 的 timeout 使用 -t；握手与完整应答共享同一个总时限。
+    timeout -t "$HTTP_TIMEOUT" nc -w "$HTTP_TIMEOUT" 127.0.0.1 "$SOCKS_PORT" \
+        < "$probe_dir/send" > "$probe_dir/receive" 9>&- 8>&- 2>/dev/null &
+    client_pid=$!
+    exec 7>"$probe_dir/send"
+    exec 6<"$probe_dir/receive"
+    read_hex() {
+        data=$(dd bs=1 count="$1" <&6 2>/dev/null | hexdump -v -e '1/1 "%02x"')
+        [ "${#data}" = "$(( $1 * 2 ))" ] && printf '%s' "$data"
+    }
+    phase=socks-auth
+    printf '\005\001\000' >&7
+    [ "$(read_hex 2)" = 0500 ] || return 1
+    phase=socks-connect
+    address=$(printf '%s\n' "$resolver" | awk -F. '{for (field=1; field<=4; field++) printf "\\%03o", $field}')
+    printf '\005\001\000\001%b\000\065' "$address" >&7
+    header=$(read_hex 4) || return 1
+    case "$header" in
+        05000001) read_hex 6 >/dev/null || return 1;;
+        05000004) read_hex 18 >/dev/null || return 1;;
+        05000003)
+            size=$(read_hex 1) || return 1
+            read_hex "$((0x$size + 2))" >/dev/null || return 1;;
+        *) return 1;;
+    esac
+    phase=dns-response
+    # example.com A/IN，事务 ID 0x1234；TCP 长度为 29，不使用 WAN DNS 或 HTTP。
+    printf '\000\035\022\064\001\000\000\001\000\000\000\000\000\000\007example\003com\000\000\001\000\001' >&7
+    size=$(read_hex 2) || return 1
+    length=$((0x$size))
+    [ "$length" -ge 45 ] && [ "$length" -le 4096 ] || return 1
+    reply=$(read_hex "$length") || return 1
+    # 验证完整帧、ID、响应/操作码、未截断、RCODE=0、问题和非空答案。
+    printf '%s\n' "$reply" | awk '
+        substr($0,1,4)=="1234" && substr($0,5,2)~/^8[0145]$/ &&
+        substr($0,8,1)=="0" && substr($0,9,4)=="0001" && substr($0,13,4)!="0000" &&
+        substr($0,25,34)=="076578616d706c6503636f6d0000010001" {ok=1}
+        END {exit !ok}
+    '
+)
 health_probe() (
     # 独立子 shell 避免覆盖控制循环变量。强制经 SOCKS、校验证书，不跟随跳转。
     # --disable 忽略 curlrc；失败不能因环境代理、NO_PROXY 或重试而绕路或无限等待。
@@ -396,6 +453,10 @@ healthy() {
     netstat -lnt | grep -q ":$DNS_PORT " || { log 'health local failed: DNS listener missing'; return 1; }
     health_local_failed=0
     health_probe primary "$HEALTH_URL" "$HEALTH_STATUS" && return 0
+    # 两个国内公共 DNS 逐一复核，任一有效应答即成功；不会直接访问校园 WAN。
+    for resolver in $HEALTH_DNS_SERVERS; do
+        health_dns "$resolver" && return 0
+    done
     [ -n "$HEALTH_FALLBACK_URL" ] || return 1
     # 独立目的地复核单站点故障；仍完整经过同一个 Xray 隧道。
     health_probe secondary "$HEALTH_FALLBACK_URL" "$HEALTH_FALLBACK_STATUS"

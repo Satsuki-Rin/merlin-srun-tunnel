@@ -10,7 +10,7 @@
 
 实测设备为 **RT-AC68U / Asuswrt-Merlin 386.14.2 / Linux 2.6.36.4**，使用单 LAN、单 WAN，以及支持 SRBX1 的深澜门户。代理服务端需支持 **VLESS + TLS + XHTTP stream-one**，家庭 DNS 通过隧道可达。
 
-需要固件提供 JFFS 自定义脚本、`curl`、`openssl`、`flock`、带位运算的 `awk`、`iptables-restore`、`ip6tables-restore` 和 TUN。其他 CPU、固件、门户、访客桥或多 WAN 拓扑需要单独适配和验证。
+需要固件提供 JFFS 自定义脚本、`curl`、`openssl`、`flock`、带位运算的 `awk`、`iptables-restore`、`ip6tables-restore` 和 TUN。DNS 备用探测还使用 BusyBox 的 `nc`、`timeout -t`、`mknod`、`dd` 和 `hexdump`。其他 CPU、固件、门户、访客桥或多 WAN 拓扑需要单独适配和验证。
 
 **Xray 是独立依赖，仓库不分发可执行文件。** RT-AC68U 的实测环境需要 `GOARM=5` 软浮点构建；架构、内核与功能兼容要求见 [Xray 构建说明](docs/XRAY.md)。
 
@@ -37,7 +37,7 @@ flowchart TD
 
 模式在重启后保留。`off` 不会注销已经建立的校园会话；需要注销时再执行 `logout`。端点 DNS、门户 HTTP 等必要引导流量会直连，具体边界见 [运行与配置](docs/OPERATIONS.md#流量保护与-dns)。
 
-隧道健康默认探测家庭端点的 nginx fallback 页面，经过本地 SOCKS 完成 HTTPS 请求并检查预期状态码；主探测失败才请求独立的备用站点，任一成功即可放行。已经正常工作的隧道允许一次网络探测失败，连续两轮失败才封锁重启；冷启动、本地进程或 TUN 缺失不享受该容错，始终不回落到 WAN 直连。该检查不能代表所有公网网站、家庭 DNS 或反向组网都正常。
+隧道健康默认探测家庭端点的 nginx fallback 页面，经过本地 SOCKS 完成 HTTPS 请求并检查预期状态码；主探测失败后，依次通过同一 SOCKS 向 `119.29.29.29`、`223.5.5.5` 的 TCP/53 查询 `example.com`，任一个有效 DNS 应答即可确认可用。默认不依赖 Google 或 Cloudflare。已经正常工作的隧道允许一次网络探测失败，连续两轮失败才封锁重启；冷启动、本地进程或 TUN 缺失不享受该容错，始终不回落到 WAN 直连。该检查不能代表所有公网网站、家庭 DNS 或反向组网都正常。
 
 ## 安装
 
@@ -117,7 +117,7 @@ docs/XRAY.md              二进制来源、构建与上游许可
 tests/                    隔离回归与显式实机测试
 ```
 
-Linux 开发机上运行，无需路由器、真实配置或 Xray：
+Linux 开发机上运行，无需路由器、真实配置或 Xray。除 Python 3.10+ 外，协议回归测试需要 `nc`、`timeout`、`mknod`、`dd` 和 `hexdump`；Debian/Ubuntu 可安装 `netcat-openbsd`、`bsdextrautils` 和 `coreutils`：
 
 ```sh
 sh -n netctl.sh && sh -n install.sh

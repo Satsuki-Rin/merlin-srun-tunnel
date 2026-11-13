@@ -4,7 +4,7 @@
 
 ## 如何运行
 
-开发机使用 Linux、Python 3.10+ 和 `/bin/sh`，没有 Python 第三方依赖：
+开发机使用 Linux、Python 3.10+ 和 `/bin/sh`，没有 Python 第三方依赖。DNS 协议回归需要 `nc`、`timeout`、`mknod`、`dd` 和 `hexdump`，Debian/Ubuntu 可安装 `netcat-openbsd`、`bsdextrautils` 和 `coreutils`。使用本机模拟 SOCKS 服务，不接触公共 DNS：
 
 ```sh
 sh -n netctl.sh && sh -n install.sh
@@ -56,7 +56,7 @@ python3 tests/live.py policy
 
 ## 离线回归
 
-执行 `python3 -m unittest discover -s tests -v`。当前 37 项，覆盖：
+执行 `python3 -m unittest discover -s tests -v`。当前 42 项，覆盖：
 
 - 在线、明确离线、HTTP/解析错误和在线 IP 不匹配；未知状态不发登录。
 - HTTP 预访问先于 challenge/login；登录接受但仍离线不能报成功。
@@ -72,6 +72,7 @@ python3 tests/live.py policy
 - 自有 fallback 返回 200、主探测超时后的备用复核、全部探测失败、错误状态码、证书/传输失败不能假成功、本地服务缺失不能被外部探测掩盖。
 - 备用探测成功时不封锁或重启，下一次探测从本次完成后计时，旧配置默认状态码兼容。
 - 已放行 TUN 的一次网络失败可恢复；本地服务缺失与冷启动不能借该容错放行，连续失败仍阻断并重启。
+- 国内 DNS 顺序复核、主探测成功跳过 DNS、模拟 SOCKS 的 IPv4/IPv6/域名绑定应答、错误握手与 DNS ID/问题/RCODE/截断拒绝、总超时与连接/FIFO 清理。
 
 另外在目标路由器执行 Shell 语法检查、Xray `run -test` 和 7 个离线编码/加密向量，全部通过。编码核心保留原来经过门户验证的实现，不重写为另一种算法。
 
@@ -134,6 +135,14 @@ python3 tests/live.py policy
 | 暂停控制器并杀死 Xray | 双栈业务连接失败、未缓存 DNS 无法直连回落、路由保留拒绝后备、路由器普通 HTTPS 直连失败；恢复后约 56.6 秒完成整轮测试，最终基线通过 |
 
 实机测试等待恢复时同时检查控制器与 Xray 的有效 PID，防止强杀后旧的 online 状态文本被误当成已经恢复。客户端测试中曾有单次 TLS reset，随后单独复核及完整客户端轮次通过；不将这次修复描述为消除了全部上游或无线网络抖动，也不宣称修复了之前尚未定位的所有 SSH 超时。
+
+### 国内 DNS 备用探测
+
+后续将默认备用方式改为通过 SOCKS 向 `119.29.29.29`、`223.5.5.5` 的 TCP/53 发出 `example.com A` 查询，移除模板中的 Cloudflare 探测。42 项隔离回归全部通过，新增 SOCKS 分阶段握手、DNS 应答校验、总超时和资源清理测试。
+
+实机观察到腾讯 DNS 未给出有效 DNS 应答，阿里 DNS 给出有效应答；强制主 HTTPS 探测失败后，脚本继续到阿里 DNS 并返回健康。短暂暂停 Xray 时，两台公共 DNS 的探测均返回失败，恢复进程后正常配置的健康检查返回 0。这验证了 DNS 请求实际依赖隧道，没有利用原有 WAN 引导 DNS 白名单绕行。单台服务器本次成功或失败不代表其长期可用性；按顺序尝试且任一成功即可。
+
+部署后绑定 LAN 客户端的 IPv4/IPv6 HTTPS 均返回 200；IPv4 UDP/TCP DNS、指定外部 DNS 的重定向和 IPv6 DNS 单独复核全部成功。此前一次整轮客户端检查有单次 DNS 无应答，未把它隐藏为首次即通过，也未将本次改动声称为消除了既有链路抖动。
 
 ## 测试边界
 
